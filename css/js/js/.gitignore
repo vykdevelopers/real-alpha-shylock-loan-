@@ -1,7 +1,0 @@
-# Local secrets and tooling
-.env
-.env.*
-!.env.example
-node_modules/
-.DS_Store
-.supabase/
