@@ -1,0 +1,162 @@
+-- REAL ALPHA SHYLOCK LOAN: complete Supabase schema (base tables + security hardening)
+-- Run in Supabase Dashboard > SQL Editor. Safe to re-run.
+-- IMPORTANT: never expose a service_role key in the browser.
+
+create extension if not exists pgcrypto;
+
+create table if not exists public.staff (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+alter table public.staff enable row level security;
+drop policy if exists "staff can see own row" on public.staff;
+create policy "staff can see own row" on public.staff
+  for select to authenticated using (user_id = auth.uid());
+
+create or replace function public.is_staff()
+returns boolean language sql stable security definer
+set search_path = public
+as $$
+  select exists (select 1 from public.staff where user_id = auth.uid());
+$$;
+revoke all on function public.is_staff() from public;
+grant execute on function public.is_staff() to authenticated;
+
+create table if not exists public.applications (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  email text default (auth.jwt() ->> 'email'),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  full_name text not null check (char_length(full_name) between 2 and 100),
+  phone text not null check (phone ~ '^(\+254|0)[17][0-9]{8}$'),
+  id_number text not null check (id_number ~ '^[0-9]{6,10}$'),
+  loan_amount integer not null check (loan_amount between 5000 and 50000 and loan_amount % 500 = 0),
+  loan_type text not null check (loan_type in ('Business Loan', 'Education Loan', 'Emergency Loan')),
+  marital_status text not null check (marital_status in ('Single', 'Married', 'Divorced', 'Widowed')),
+  spouse_name text check (spouse_name is null or char_length(spouse_name) <= 100),
+  guarantor_name text not null check (char_length(guarantor_name) between 2 and 100),
+  guarantor_phone text not null check (guarantor_phone ~ '^(\+254|0)[17][0-9]{8}$'),
+  purpose_details text not null check (char_length(purpose_details) between 3 and 2000),
+  passport_path text not null,
+  id_front_path text not null,
+  id_back_path text not null,
+  status text not null default 'submitted'
+    check (status in ('submitted', 'under_review', 'approved', 'rejected')),
+  staff_note text check (staff_note is null or char_length(staff_note) <= 1000)
+);
+create index if not exists applications_user_idx on public.applications(user_id, created_at desc);
+alter table public.applications enable row level security;
+
+create or replace function public.touch_updated_at()
+returns trigger language plpgsql as $$
+begin new.updated_at = now(); return new; end;
+$$;
+drop trigger if exists applications_touch on public.applications;
+create trigger applications_touch before update on public.applications
+for each row execute function public.touch_updated_at();
+
+drop policy if exists "customers can apply" on public.applications;
+create policy "customers can apply" on public.applications
+for insert to authenticated
+with check (user_id = auth.uid() and status = 'submitted' and staff_note is null);
+
+drop policy if exists "customers see own, staff see all" on public.applications;
+create policy "customers see own, staff see all" on public.applications
+for select to authenticated
+using (user_id = auth.uid() or public.is_staff());
+
+drop policy if exists "staff can review" on public.applications;
+create policy "staff can review" on public.applications
+for update to authenticated
+using (public.is_staff()) with check (public.is_staff());
+
+-- Savings are entered only by authorised staff. Customers can read their own records.
+create table if not exists public.savings (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  application_id uuid references public.applications(id) on delete set null,
+  amount bigint not null check (amount > 0),
+  note text check (note is null or char_length(note) <= 250),
+  recorded_by uuid not null default auth.uid() references auth.users(id),
+  recorded_at timestamptz not null default now()
+);
+create index if not exists savings_user_idx on public.savings(user_id, recorded_at desc);
+alter table public.savings enable row level security;
+drop policy if exists "customers read own savings, staff read all" on public.savings;
+create policy "customers read own savings, staff read all" on public.savings
+for select to authenticated using (user_id = auth.uid() or public.is_staff());
+drop policy if exists "staff insert savings" on public.savings;
+create policy "staff insert savings" on public.savings
+for insert to authenticated
+with check (public.is_staff() and recorded_by = auth.uid());
+
+-- Private storage for identity documents.
+insert into storage.buckets(id, name, public, file_size_limit, allowed_mime_types)
+values ('documents', 'documents', false, 5242880, array['image/jpeg','image/png','image/webp'])
+on conflict (id) do update set public = false, file_size_limit = 5242880,
+allowed_mime_types = array['image/jpeg','image/png','image/webp'];
+
+drop policy if exists "customers upload to own folder" on storage.objects;
+create policy "customers upload to own folder" on storage.objects
+for insert to authenticated
+with check (bucket_id = 'documents' and (storage.foldername(name))[1] = auth.uid()::text);
+
+drop policy if exists "customers read own, staff read all" on storage.objects;
+create policy "customers read own, staff read all" on storage.objects
+for select to authenticated
+using (bucket_id = 'documents' and
+  ((storage.foldername(name))[1] = auth.uid()::text or public.is_staff()));
+
+-- Staff membership must be assigned manually by a trusted project administrator:
+-- 1) Create the staff person's account through the website.
+-- 2) Run the separate provisioning SQL in supabase/ADD_STAFF.sql.
+
+
+-- 1. Staff may change only the review fields, never the applicant's details.
+revoke update on public.applications from authenticated;
+grant update (status, staff_note) on public.applications to authenticated;
+
+-- 2. Applicants cannot spoof the email on their application.
+drop policy if exists "customers can apply" on public.applications;
+create policy "customers can apply" on public.applications
+for insert to authenticated
+with check (
+  user_id = auth.uid()
+  and status = 'submitted'
+  and staff_note is null
+  and email = (auth.jwt() ->> 'email')
+);
+
+-- 3. Document paths must sit inside the applicant's own storage folder.
+alter table public.applications drop constraint if exists docs_in_own_folder;
+alter table public.applications add constraint docs_in_own_folder check (
+  passport_path like user_id::text || '/%' and
+  id_front_path like user_id::text || '/%' and
+  id_back_path  like user_id::text || '/%'
+) not valid;  -- "not valid" = enforced for new rows, does not fail on old test rows
+
+-- 4. Record who last reviewed an application, and when.
+alter table public.applications
+  add column if not exists reviewed_by uuid references auth.users(id),
+  add column if not exists reviewed_at timestamptz;
+
+create or replace function public.stamp_review()
+returns trigger language plpgsql as $$
+begin
+  if new.status is distinct from old.status
+     or new.staff_note is distinct from old.staff_note then
+    new.reviewed_by := auth.uid();
+    new.reviewed_at := now();
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists applications_stamp_review on public.applications;
+create trigger applications_stamp_review before update on public.applications
+for each row execute function public.stamp_review();
+
+-- 5. OPTIONAL: allow only one open application per customer.
+--    Remove the leading "--" on the next two lines to turn this on.
+-- create unique index if not exists one_open_application
+--   on public.applications(user_id) where status in ('submitted','under_review');
